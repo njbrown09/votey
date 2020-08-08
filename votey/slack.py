@@ -105,6 +105,12 @@ def handle_poll_creation(req: JSON) -> Any:
     db.session.add(poll)
     db.session.commit()
 
+    # write the poll question and a divider to the blocks list
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": poll_question}},
+        {"type": "divider"},
+    ]
+
     for counter, option_text in enumerate(command):
         option = Option(poll.id, option_text)
         db.session.add(option)
@@ -112,56 +118,67 @@ def handle_poll_creation(req: JSON) -> Any:
 
         actions.append(
             {
-                "name": str(counter),
-                "text": NUM_TO_SLACKMOJI[counter + 1],
-                "value": option.id,
                 "type": "button",
+                "text": {
+                    "type": "plain_text",
+                    "text": NUM_TO_SLACKMOJI[counter + 1],
+                    "emoji": True,
+                },
+                "action_id": str(option.id) + "?" + str(counter),
+                "value": str(poll.poll_identifier()),
             }
         )
         fields.append(
             {
-                "title": "",
-                "value": f"{NUM_TO_SLACKMOJI[counter + 1]} {option_text}\n\n\n",
-                "short": False,
-                "mrkdwn": "true",
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"{NUM_TO_SLACKMOJI[counter + 1]} {option_text}\n\n\n",
+                },
             }
         )
 
-    attachments = [
+    # write options to the blocks list
+    blocks.extend(fields)
+
+    # write the footer to the blocks list
+    blocks.append(
         {
-            "text": poll_question,
-            "mrkdwn_in": ["fields"],
-            "color": "#6ecadc",
-            "fields": fields,
-            "footer": get_footer(req.get("user_id", ""), anonymous, secret),
-            "ts": time.time(),
-        },
-    ]
-    for batched in batch(actions, 5):
-        attachments.append(
-            {
-                "text": " ",
-                "callback_id": poll.poll_identifier(),
-                "attachment_type": "default",
-                "color": "#6ecadc",
-                "actions": batched,
-            }
-        )
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": get_footer(req.get("user_id", ""), anonymous, secret),
+                }
+            ],
+        }
+    )
 
-    delete_attachment = {
-        "text": " ",
-        "callback_id": poll.poll_identifier(),
-        "actions": [
-            {"name": "delete", "text": "Delete", "type": "button", "style": "danger"}
-        ],
-    }
+    # batch actions in groups of 5 so Slack does not hide them in a context menu
+    for batched in batch(actions, 5):
+        blocks.append({"type": "actions", "elements": batched})
+
     current_app.logger.debug("writing poll to channel {}".format(channel))
-    res = send_message(workspace, channel, attachments=attachments).json()
+    res = send_message(workspace, channel, blocks=blocks).json()
     current_app.logger.debug("got poll creation response: {}".format(res))
+
+    # if the poll creation was successful
     if "ts" in res:
         poll.ts = res["ts"]
         db.session.commit()
 
+        delete_attachment = {
+            "text": " ",
+            "callback_id": poll.poll_identifier(),
+            "actions": [
+                {
+                    "name": "delete",
+                    "text": "Delete",
+                    "type": "button",
+                    "style": "danger",
+                }
+            ],
+        }
         send_message(
             workspace,
             req.get("user_id", ""),
@@ -172,7 +189,7 @@ def handle_poll_creation(req: JSON) -> Any:
         body = {
             "response_type": "in_channel",
             "text": " ",
-            "attachments": attachments,
+            "blocks": blocks,
         }
         current_app.logger.debug("DIRECTLY returning {}".format(body))
         return jsonify(body)
@@ -181,22 +198,22 @@ def handle_poll_creation(req: JSON) -> Any:
 
 def handle_button_interaction(req: JSON) -> Any:
     res = json.loads(req.get("payload", ""))
-    button = res.get("actions")[0]["name"]
-    return handle_poll_deletion(res) if button == "delete" else handle_vote(res)
+    # import pdb;pdb.set_trace()
+    # button = res.get("actions")[0]["name"]
+    # return handle_poll_deletion(res) if button == "delete" else handle_vote(res)
+    return handle_vote(res)
 
 
 def handle_vote(response: AnyJSON) -> Any:
     current_app.logger.debug("handling vote with req {}".format(response))
-    poll = Poll.query.filter_by(identifier=response.get("callback_id")).first()
-    option = Option.query.filter_by(id=response.get("actions", [])[0]["value"]).first()
-    # workspace = Workspace.query.filter_by(
-    #     team_id=response.get("team", {}).get("id")
-    # ).first()
-    # channel = response.get("channel", {}).get("id")
-    # attachment_id = int(response.get("attachment_id", "-1"))
+    option_id, position = response.get("actions", [])[0]["action_id"].split("?")
+    position = int(position)
+
+    poll = Poll.query.filter_by(identifier=response.get("actions")[0]["value"]).first()
+    option = Option.query.filter_by(id=option_id).first()
+
     user = response.get("user", {}).get("id")
-    original_message = response.get("original_message", {})
-    attachments = original_message.get("attachments")
+    original_message = response.get("message", {})
 
     if poll is not None and option is not None:
         vote = Vote.query.filter_by(
@@ -210,8 +227,6 @@ def handle_vote(response: AnyJSON) -> Any:
             db.session.add(vote)
         db.session.commit()
 
-        position = int(response.get("actions", [])[0]["name"])
-
         votes = Vote.query.filter_by(option_id=option.id).all()
         num = f"`{len(votes)}`"
         field_text = (
@@ -219,7 +234,11 @@ def handle_vote(response: AnyJSON) -> Any:
             f'{num if votes else ""}\n'
             f"{thumbs(votes) if poll.anonymous else names(votes)}\n\n"
         )
-        attachments[0].get("fields")[position]["value"] = field_text
+
+        original_message.get("blocks")[position + 2]["text"]["text"] = field_text
+        import pdb
+
+        pdb.set_trace()
         return jsonify(original_message)
     return ""
 
@@ -333,12 +352,15 @@ def send_message(
     dest: str,
     text: Optional[str] = None,
     attachments: Optional[List[Any]] = None,
+    blocks: Optional[List[Any]] = None,
 ) -> requests.Response:
     body: Any = {"channel": dest}
     if text is not None:
         body["text"] = text
     if attachments is not None:
         body["attachments"] = attachments
+    if blocks is not None:
+        body["blocks"] = blocks
     return requests.post(
         "https://slack.com/api/chat.postMessage",
         json=body,
