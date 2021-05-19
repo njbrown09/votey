@@ -37,6 +37,7 @@ jobs:
       - run:
           command: |  # use pipenv to install dependencies
             pip install pipenv
+            pipenv lock --clear
             pipenv install
       - run:
           name: Run tests
